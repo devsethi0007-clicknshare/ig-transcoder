@@ -43,4 +43,67 @@ function spawnFfmpeg(id) {
     job.proc = null;
     job.lastError = `exit code=${code} signal=${signal} :: ${errTail.slice(-400)}`;
     if (job.stopping) { jobs.delete(id); return; }
-    if (job.restarts >= MAX_RESTARTS) { console.error(`[${id}] gave up`); jobs.delete(id);
+    if (job.restarts >= MAX_RESTARTS) { console.error(`[${id}] gave up`); jobs.delete(id); return; }
+    job.restarts += 1;
+    console.error(`[${id}] ffmpeg died (code=${code}); restart ${job.restarts}/${MAX_RESTARTS}`);
+    setTimeout(() => spawnFfmpeg(id), RESTART_DELAY);
+  });
+  console.log(`[${id}] ffmpeg -> ${job.target}  (${WIDTH}x${HEIGHT} @ ${BITRATE})`);
+}
+
+function startJob(id, ingestUrl, target) {
+  stopJob(id);
+  jobs.set(id, { proc: null, ingestUrl, target, restarts: 0, stopping: false, lastError: null, startedAt: Date.now() });
+  spawnFfmpeg(id);
+}
+
+function stopJob(id) {
+  const job = jobs.get(id);
+  if (!job) return false;
+  job.stopping = true;
+  if (job.proc) { try { job.proc.kill('SIGTERM'); } catch (_) {} }
+  jobs.delete(id);
+  return true;
+}
+
+function readBody(req) {
+  return new Promise((resolve) => {
+    let b = '';
+    req.on('data', (c) => { b += c; if (b.length > 1e6) req.destroy(); });
+    req.on('end', () => resolve(b));
+  });
+}
+
+const server = http.createServer(async (req, res) => {
+  const send = (code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)); };
+  try {
+    if (req.method === 'GET' && req.url === '/health') {
+      const list = [...jobs.entries()].map(([id, j]) => ({ id, target: j.target, up: !!j.proc, restarts: j.restarts, lastError: j.lastError }));
+      return send(200, { ok: true, count: jobs.size, resolution: `${WIDTH}x${HEIGHT}`, jobs: list });
+    }
+    if (SECRET && req.headers['x-ig-secret'] !== SECRET) return send(401, { ok: false, error: 'unauthorized' });
+    if (req.method === 'POST' && req.url === '/start') {
+      const body = JSON.parse((await readBody(req)) || '{}');
+      const { id, ingestUrl, target } = body;
+      if (!id || !ingestUrl || !target) return send(400, { ok: false, error: 'id, ingestUrl and target are required' });
+      startJob(String(id), String(ingestUrl), String(target));
+      return send(200, { ok: true, id: String(id) });
+    }
+    if (req.method === 'POST' && req.url === '/stop') {
+      const body = JSON.parse((await readBody(req)) || '{}');
+      const { id } = body;
+      if (!id) return send(400, { ok: false, error: 'id is required' });
+      return send(200, { ok: true, id: String(id), existed: stopJob(String(id)) });
+    }
+    return send(404, { ok: false, error: 'not found' });
+  } catch (e) { return send(500, { ok: false, error: String((e && e.message) || e) }); }
+});
+
+function shutdown() { for (const id of [...jobs.keys()]) stopJob(id); server.close(() => process.exit(0)); setTimeout(() => process.exit(0), 2000).unref(); }
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
+
+server.listen(PORT, () => {
+  console.log(`ig-transcoder listening on :${PORT} (${WIDTH}x${HEIGHT} @ ${BITRATE}, preset ${PRESET})`);
+  if (!SECRET) console.warn('WARNING: IG_SHARED_SECRET not set — endpoints UNAUTHENTICATED.');
+});
